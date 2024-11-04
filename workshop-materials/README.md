@@ -1,0 +1,233 @@
+# SQL injection example
+
+## Setup and sample run
+
+The jdbc connector at https://github.com/xerial/sqlite-jdbc, from [https://github.com/xerial/sqlite-jdbc/releases/download/3.36.0.1/sqlite-jdbc-3.36.0.1.jar](here) is included in the git repository.
+
+```bash
+# Use a simple headline prompt 
+PS1='
+\033[32m---- SQL injection demo ----\[\033[33m\033[0m\]
+$?:$ '
+
+# Build
+./build.sh
+
+# Prepare db
+./admin -r
+./admin -c
+./admin -s 
+
+# Add regular user interactively
+./add-user 2>> users.log
+First User
+
+# Check
+./admin -s
+
+# Add Johnny Droptable 
+./add-user 2>> users.log
+Johnny'); DROP TABLE users; --
+
+# And the problem:
+./admin -s
+
+# Check the log
+tail users.log
+```
+
+## Identify the problem
+
+`./add-user` is reading from `STDIN`, and writing to a database; looking at the code in [AddUser.java](AddUser.java) leads to:
+
+```java
+System.console().readLine();
+```
+
+for the read and:
+
+```java
+conn.createStatement().executeUpdate(query);
+```
+
+for the write.
+
+This problem is thus a dataflow problem; in codeql terminology we have
+- a _source_ at the `System.console().readLine();`
+- a _sink_ at the `conn.createStatement().executeUpdate(query);`
+
+We write codeql to identify these two, and then connect them via
+- a _dataflow configuration_ -- for this problem, the more general _taintflow configuration_. 
+   
+## Build codeql database
+
+To get started, build the codeql database (adjust paths to your setup):
+
+```bash
+# Build the db with source commit id.
+export PATH=$HOME/local/vmsync/codeql250:"$PATH"
+SRCDIR=$(pwd)
+DB=$SRCDIR/java-sqli-$(cd $SRCDIR && git rev-parse --short HEAD)
+
+echo $DB
+test -d "$DB" && rm -fR "$DB"
+mkdir -p "$DB"
+
+cd $SRCDIR && codeql database create --language=java -s . -j 8 -v $DB --command='./build.sh'
+
+# Check for AddUser in the db
+unzip -v $DB/src.zip | grep AddUser
+```
+
+Then add this database directory to your VS Code `DATABASES` tab.
+
+## Build codeql database in steps
+
+For larger projects, using a single command to build everything is costly when any part of the build fails.
+   
+To build a database in steps, use the following sequence, adjusting paths to
+your setup:
+
+```bash
+# Build the db with source commit id.
+export PATH=$HOME/local/vmsync/codeql250:"$PATH"
+SRCDIR=$HOME/local/codeql-training-material.java-sqli/java/codeql-dataflow-sql-injection
+DB=$SRCDIR/java-sqli-$(cd $SRCDIR && git rev-parse --short HEAD)
+
+# Check paths
+echo $DB
+echo $SRCDIR
+
+# Prepare db directory
+test -d "$DB" && rm -fR "$DB"
+mkdir -p "$DB"
+
+# Run the build
+cd $SRCDIR
+codeql database init --language=java -s . -v $DB
+# Repeat trace-command as needed to cover all targets
+codeql database trace-command -v $DB -- make 
+codeql database finalize -j4 $DB
+```
+
+Then add this database directory to your VS Code `DATABASES` tab.
+
+## Develop the query bottom-up
+
+1. Identify the _source_ part of the `System.console().readLine()` expression, the `buf` argument.  
+   Start from a `from..where..select`, then convert to a predicate.
+
+2. Identify the _sink_ part of the `conn.createStatement().executeUpdate(query)` expression, the
+   `query` argument. Again start from `from..where..select`, then convert to a predicate.
+
+3. Fill in the _taintflow configuration_ boilerplate:
+
+```java
+import semmle.code.java.dataflow.TaintTracking
+
+module SqliFlowConfig implements DataFlow::ConfigSig {
+  predicate isSource(DataFlow::Node source) {
+    none()
+  }
+
+  predicate isSink(DataFlow::Node sink) {
+    none()
+  }
+}
+
+module MyFlow = TaintTracking::Global<SqliFlowConfig>;
+```
+
+The final query (without `isAdditionalTaintStep`) is:
+
+```codeql
+/**
+ * @name SQLI Vulnerability
+ * @description Using untrusted strings in a sql query allows sql injection attacks.
+ * @kind path-problem
+ * @id java/SQLIVulnerable
+ * @problem.severity warning
+ */
+
+import java
+import semmle.code.java.dataflow.TaintTracking
+
+module SqliFlowConfig implements DataFlow::ConfigSig {
+
+  predicate isSource(DataFlow::Node source) {
+    // System.console().readLine();
+    exists(Call read |
+      read.getCallee().getName() = "readLine" and
+      read = source.asExpr()
+    )
+  }
+
+  predicate isSink(DataFlow::Node sink) {
+    // conn.createStatement().executeUpdate(query);
+    exists(Call exec |
+      exec.getCallee().getName() = "executeUpdate" and
+      exec.getArgument(0) = sink.asExpr()
+    )
+  }
+}
+
+module MyDataFlow = TaintTracking::Global<SqliFlowConfig>;
+import MyDataFlow::PathGraph
+
+from MyDataFlow::PathNode source, MyDataFlow::PathNode sink
+where MyDataFlow::flowPath(source, sink)
+select sink, source, sink, "Possible SQL injection"
+```
+
+## Optional: sarif file review of the results
+
+Query results are available in several output formats using the cli.  The
+following produces the sarif format, a json-based result description.
+
+```bash
+# The setup information from before
+export PATH=$HOME/local/vmsync/codeql250:"$PATH"
+SRCDIR=$HOME/local/codeql-training-material.java-sqli/java/codeql-dataflow-sql-injection
+DB=$SRCDIR/java-sqli-$(cd $SRCDIR && git rev-parse --short HEAD)
+
+# Check paths
+echo $DB
+echo $SRCDIR
+
+# To see the help
+codeql database analyze -h
+
+# Run a query
+codeql database analyze                         \
+       -v                                       \
+       --ram=14000                              \
+       -j12                                     \
+       --rerun                                  \
+       --search-path ~/local/vmsync/ql          \
+       --format=sarif-latest                    \
+       --output java-sqli.sarif                 \
+       --                                       \
+       $DB                                      \
+       $SRCDIR/SqlInjection.ql
+
+# Examine the file in an editor
+edit java-sqli.sarif
+```
+
+An example of using the sarif data is in the the jq script [sarif-summary.jq](sarif-summary.jq)
+When run against the sarif input via 
+
+```sh
+jq --raw-output --join-output  -f sarif-summary.jq < java-sqli.sarif > java-sqli.txt
+```
+
+it produces output in a form close to that of compiler error messages:
+
+```
+query-id: message line 
+ Path
+    ...
+ Path
+    ...
+```
+
